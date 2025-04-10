@@ -1,75 +1,26 @@
 from unsloth import FastLanguageModel
 import torch
-max_seq_length = 1024 # Can increase for longer reasoning traces
-lora_rank = 32 # Larger rank = smarter, but slower
-
-target_modules = [
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
-] # Remove QKVO if out of memory
-
-print('HERE')
-
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/DeepSeek-R1-Distill-Qwen-7B", # TODO: replace with deepseek qwen?
-    max_seq_length = max_seq_length,
-    load_in_4bit = True, # False for LoRA 16bit
-    fast_inference = True, # Enable vLLM fast inference
-    max_lora_rank = lora_rank,
-    gpu_memory_utilization = 0.6, # Reduce if out of memory
-    # supported_lora_modules = target_modules
-)
-
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = lora_rank, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-    target_modules = target_modules,
-    lora_alpha = lora_rank,
-    use_gradient_checkpointing = "unsloth", # Enable long context finetuning
-    random_state = 3407,
-)
-
-
 import re
 from datasets import load_dataset, Dataset
-from iad_utils import GSM8K_PROMPT
-
+from huggingface_hub import login
+from iad_utils import load_model, get_gsm8k_questions, extract_xml_answer, GSM8K_PROMPT
+from trl import GRPOConfig, GRPOTrainer
 
 XML_COT_FORMAT = """
 ... 
-</think>
+</think>-
 ...
 <answer>
 {answer}
 </answer>
 """
 
-def extract_xml_answer(text: str) -> str:
-    answer = text.split("<answer>")[-1]
-    answer = answer.split("</answer>")[0]
-    return answer.strip()
-
-def extract_hash_answer(text: str) -> str | None:
-    if "####" not in text:
-        return None
-    return text.split("####")[1].strip()
-
-# uncomment middle messages for 1-shot prompting
-def get_gsm8k_questions(split = "train") -> Dataset:
-    data = load_dataset('openai/gsm8k', 'main')[split] # type: ignore
-    data = data.map(lambda x: { # type: ignore
-        'prompt': GSM8K_PROMPT.format(question=x['question']), # TODO: do I need to add an instruction?
-        'answer': extract_hash_answer(x['answer'])
-    }) # type: ignore
-    return data # type: ignore
-
-dataset = get_gsm8k_questions()
 
 # Reward functions
 def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
     extracted_responses = [extract_xml_answer(r) for r in completions]
     print('-'*20, f"\nRESPONSE:\n{completions[0]}", f"\nEXTRACTED:{extracted_responses[0]}\nANSWER:{answer[0]}")
-    # print('-'*20, f"PROMPT:\n{prompts[0]}", f"\nANSWER:\n{answer[0]}", f"\nRESPONSE:\n{completions[0]}", f"\nEXTRACTED:\n{extracted_responses[0]}")
+    # print('-'*20, f"PROMPT:\n{prompts[0]}\nRESPONSE:\n{completions[0]}", f"\nEXTRACTED:{extracted_responses[0]}\nANSWER:{answer[0]}")
     return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
 
 def int_reward_func(completions, **kwargs) -> list[float]:
@@ -78,14 +29,14 @@ def int_reward_func(completions, **kwargs) -> list[float]:
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
     """Reward function that checks if the completion has a specific format."""
-    pattern = r".*</think>.*<answer>.*</answer>.*"
-    matches = [re.match(pattern, r) for r in completions]
+    pattern = r"^.*</think>\n.*\n<answer>\n.*\n</answer>\n$"
+    matches = [re.match(pattern, r, re.DOTALL) for r in completions]
     return [0.5 if match else 0.0 for match in matches]
 
 def soft_format_reward_func(completions, **kwargs) -> list[float]:
     """Reward function that checks if the completion has a specific format."""
-    pattern = r".*</think>.*<answer>.*</answer>.*"
-    matches = [re.match(pattern, r) for r in completions]
+    pattern = r"^.*</think>.*<answer>.*</answer>.*"
+    matches = [re.match(pattern, r, re.DOTALL) for r in completions]
     return [0.5 if match else 0.0 for match in matches]
 
 def count_xml(text) -> float:
@@ -94,7 +45,8 @@ def count_xml(text) -> float:
         count += 0.166
     if text.count("\n<answer>\n") == 1:
         count += 0.166
-        count -= len(text.split("\n</answer>\n")[-1])*0.001
+        # count -= len(text.split("\n</answer>\n")[-1])*0.001
+        count -= len(text.split("\n<answer>\n")[-1])*0.001
     if text.count("\n</answer>") == 1:
         count += 0.166
         count -= (len(text.split("\n</answer>")[-1]) - 1)*0.001
@@ -103,64 +55,59 @@ def count_xml(text) -> float:
 def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     return [count_xml(c) for c in completions]
 
-"""<a name="Train"></a>
-### Train the model
+max_prompt_length = 512
 
-Now set up GRPO Trainer and all configurations!
-"""
+def amplify(model, tokenizer, dataset, output_dir):
+    training_args = GRPOConfig(
+        learning_rate = 5e-6,
+        adam_beta1 = 0.9,
+        adam_beta2 = 0.99,
+        weight_decay = 0.1,
+        warmup_ratio = 0.1,
+        lr_scheduler_type = "cosine",
+        optim = "paged_adamw_8bit",
+        logging_steps = 1,
+        per_device_train_batch_size = 8,
+        gradient_accumulation_steps = 1, # Increase to 4 for smoother training
+        num_generations = 6, # Decrease if out of memory
+        max_prompt_length = max_prompt_length,
+        max_completion_length = 1024,
+        # num_train_epochs = 1, # Set to 1 for a full training run
+        max_steps = 250,
+        save_steps = 250,
+        max_grad_norm = 0.1,
+        report_to = "wandb", # Can use Weights & Biases
+        output_dir = "R1-Qwen-7B-gsm8k-amplification1",
+    )
 
-max_prompt_length = 256
+    trainer = GRPOTrainer(
+        model = model,
+        processing_class = tokenizer,
+        reward_funcs = [
+            xmlcount_reward_func,
+            soft_format_reward_func,
+            strict_format_reward_func,
+            int_reward_func,
+            correctness_reward_func,
+        ],
+        args = training_args,
+        train_dataset = dataset,
+    )
+    trainer.train()
 
-from trl import GRPOConfig, GRPOTrainer
-training_args = GRPOConfig(
-    learning_rate = 5e-6,
-    adam_beta1 = 0.9,
-    adam_beta2 = 0.99,
-    weight_decay = 0.1,
-    warmup_ratio = 0.1,
-    lr_scheduler_type = "cosine",
-    optim = "paged_adamw_8bit",
-    logging_steps = 1,
-    per_device_train_batch_size = 1,
-    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
-    num_generations = 6, # Decrease if out of memory
-    max_prompt_length = max_prompt_length,
-    max_completion_length = max_seq_length - max_prompt_length,
-    # num_train_epochs = 1, # Set to 1 for a full training run
-    max_steps = 250,
-    save_steps = 250,
-    max_grad_norm = 0.1,
-    report_to = "none", # Can use Weights & Biases
-    output_dir = "outputs",
-)
+    trainer.save_model(output_dir)
 
-"""And let's run the trainer! If you scroll up, you'll see a table of rewards. The goal is to see the `reward` column increase!
+if __name__ == "__main__":
 
-You might have to wait 150 to 200 steps for any action. You'll probably get 0 reward for the first 100 steps. Please be patient!
+    # Read token from file and login
+    with open("token.txt", "r") as f:
+        hf_token = f.read().strip()
+    login(hf_token)
 
-| Step | Training Loss | reward    | reward_std | completion_length | kl       |
-|------|---------------|-----------|------------|-------------------|----------|
-| 1    | 0.000000      | 0.125000  | 0.000000   | 200.000000        | 0.000000 |
-| 2    | 0.000000      | 0.072375  | 0.248112   | 200.000000        | 0.000000 |
-| 3    | 0.000000      | -0.079000 | 0.163776   | 182.500000        | 0.000005 |
-
-"""
-
-trainer = GRPOTrainer(
-    model = model,
-    processing_class = tokenizer,
-    reward_funcs = [
-        xmlcount_reward_func,
-        # soft_format_reward_func,
-        strict_format_reward_func,
-        int_reward_func,
-        correctness_reward_func,
-    ],
-    args = training_args,
-    train_dataset = dataset,
-)
-trainer.train()
-
+    dataset = get_gsm8k_questions()
+    model, tokenizer = load_model()
+    amplify(model, tokenizer, dataset, output_dir="R1-Qwen-7B-gsm8k-amplification1")
+    
 """<a name="Inference"></a>
 ### Inference
 Now let's try the model we just trained! First, let's first try the model without any GRPO trained:
