@@ -13,7 +13,7 @@ os.environ["WANDB_PROJECT"] = "IAD"
 # MODEL_NAME = "unsloth/Llama-3.1-8B"
 # MODEL_NAME = "unsloth/DeepSeek-R1-Distill-Llama-8B"
 MODEL_NAME = "unsloth/DeepSeek-R1-Distill-Qwen-7B"
-
+response_template = " ### Answer:"
 
 # TODO: when loading a model run inference_model = ... after loading peft
 
@@ -26,13 +26,13 @@ def distillation_dataset(model, tokenizer, dataset):
         prompts = examples['prompt']
         inputs = tokenizer(prompts, padding=True, truncation=True, max_length=512, return_tensors='pt').input_ids.to(inference_model.device)
         outputs = inference_model.generate(inputs)
-        responses = tokenizer.batch_decode(outputs)
+        responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         texts = []
         for prompt, response in zip(prompts, responses):
             answer = response.split('</think>')[-1]
             # answer = response[response.rfind('</think>'):]
             # full_text = f"### Question: {question}\n ### Reply: {answer}"
-            full_text = f"{prompt}\n ### Answer: {answer}"
+            full_text = f"{prompt}\n{response_template} {answer}"
             texts.append(full_text)
         return {'text': texts}
     
@@ -43,21 +43,15 @@ def distillation_dataset(model, tokenizer, dataset):
     
     return dataset.map(batched_preprocess_fn, remove_columns=dataset['train'].column_names, batched=True, batch_size=8)
 
-# for question in dataset['train']['question'][:3]:
-#     inputs = tokenizer(question, truncation=True, max_length=1024, return_tensors='pt').input_ids.to(inference_model.device)
-#     outputs = inference_model.generate(inputs)
-#     response = tokenizer.decode(outputs[0])
-#     print(response)
 
 
 def self_distill(model, tokenizer, dataset, output_dir="output"):
-    response_template = " ### Answer:"
     collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)
     
     # Training arguments
     training_args = SFTConfig(
         output_dir=output_dir,
-        run_name=output_dir,
+        # run_name=output_dir,
         num_train_epochs=3,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,

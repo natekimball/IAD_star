@@ -6,7 +6,7 @@ if [ ! -d "ENV" ]; then
     pip install --upgrade pip
     pip install -r requirements.txt
     pip install --upgrade vllm
-    pip install bitsandbytes>=0.45.3
+    pip install --upgrade bitsandbytes
 else
     source ENV/bin/activate
 fi

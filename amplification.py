@@ -79,8 +79,8 @@ def amplify(model, tokenizer, dataset, output_dir):
         save_steps = 250,
         max_grad_norm = 0.1,
         report_to = "wandb", # Can use Weights & Biases
-        output_dir = "R1-Qwen-7B-gsm8k-amplification1",
-        run_name=output_dir
+        output_dir = output_dir,
+        # run_name=output_dir
     )
 
     trainer = GRPOTrainer(
